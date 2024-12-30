@@ -213,8 +213,10 @@ def add_spec(x: Float32[32,]) -> Float32[32,]:
 @triton.jit
 def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # We name the offsets of the pointers as "off_"
-    off_x = tl.arange(0, B0)
-    x = tl.load(x_ptr + off_x)
+    # pid = tl.program_id(0)
+    off_x = tl.arange(0, B0) 
+    x = tl.load(x_ptr + off_x) + 10.0
+    tl.store(z_ptr + off_x, x)
     # Finish me!
     return
 
@@ -237,6 +239,10 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # Finish me!
+    pid = tl.program_id(0)
+    off_x = tl.arange(0, B0) + pid * B0
+    x = tl.load(x_ptr + off_x, off_x < N0) + 10.0
+    tl.store(z_ptr + off_x, x, off_x < N0)
     return
 
 
@@ -260,6 +266,13 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    offset_x = tl.arange(0, B0)
+    offset_y = tl.arange(0, B1)
+    offset_z = offset_y[:, None] * B0 + offset_x[None, :]
+    x = tl.load(x_ptr + offset_x)
+    y = tl.load(y_ptr + offset_y)
+    z = x[None, :] + y[:, None]
+    tl.store(z_ptr + offset_z, z)
     return
 
 
@@ -287,6 +300,14 @@ def add_vec_block_kernel(
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
     # Finish me!
+    offset_x = tl.arange(0, B0) + block_id_x * B0
+    offset_y = tl.arange(0, B1) + block_id_y * B1
+    offset_z = offset_y[:, None] * N0 + offset_x[None, :]
+    x = tl.load(x_ptr + offset_x, offset_x < N0)
+    y = tl.load(y_ptr + offset_y, offset_y < N1)
+    z = y[:, None] + x[None, :]
+    'mask的维度比较关键'
+    tl.store(z_ptr + offset_z, z, (offset_x < N0)[None, :] & (offset_y < N1)[:, None])
     return
 
 
@@ -314,6 +335,18 @@ def mul_relu_block_kernel(
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
     # Finish me!
+    offset_x = tl.arange(0, B0) + block_id_x * B0
+    offset_y = tl.arange(0, B1) + block_id_y * B1
+    offset_z = offset_y[:, None] * N0 + offset_x[None, :]
+    mask_x = offset_x < N0
+    mask_y = offset_y < N1
+    x = tl.load(x_ptr + offset_x, mask_x)
+    y = tl.load(y_ptr + offset_y, mask_y)
+    z = x[None, :] * y[:, None]
+    relu_z = tl.where(z > 0, z, 0.0)
+    'z不能写到mask里面'
+    mask_z = mask_x[None, :] & mask_y[:, None]
+    tl.store(z_ptr + offset_z, relu_z, mask_z)
     return
 
 
@@ -354,6 +387,20 @@ def mul_relu_block_back_kernel(
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
     # Finish me!
+    offset_x = tl.arange(0, B0) + block_id_i * B0
+    offset_y = tl.arange(0, B1) + block_id_j * B1
+    offset_z = offset_y[:, None] * N0 + offset_x[None, :]
+    mask_x = offset_x < N0
+    mask_y = offset_y < N1
+    x = tl.load(x_ptr + offset_z, mask_x[None, :] & mask_y[:, None])
+    y = tl.load(y_ptr + offset_y, mask_y)
+    dz = tl.load(dz_ptr + offset_z, mask_x[None, :] & mask_y[:, None])
+    z = x * y[:, None]
+    df = tl.where(z > 0, 1.0, 0.0)
+    dxy_x = y[:, None]
+    dx = df * dxy_x * dz
+    tl.store(dx_ptr + offset_z, dx, mask_x[None, :] & mask_y[:, None])
+
     return
 
 
@@ -379,6 +426,16 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    block_id_i = tl.program_id(0)
+    batch_offset = block_id_i * B0 + tl.arange(0, B0)
+    mask = batch_offset < N0
+    z = tl.zeros((B0,), dtype=tl.float32)
+    for i in range(0, T, B1):
+        offset = tl.arange(0, B1) + i
+        x = tl.load(x_ptr + batch_offset[:, None] * T + offset, mask[:, None] & (offset < T))
+        z += x.sum(1)
+    tl.store(z_ptr + batch_offset, z, mask)
+
     return
 
 
@@ -420,6 +477,29 @@ def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    batch_offset = block_id_i * B0 + tl.arange(0, B0)
+    mask = batch_offset < N0
+    x_max = tl.zeros((B0,), dtype=tl.float32)
+    exp_sum = tl.zeros((B0,), dtype=tl.float32)
+    for i in range(0, T, B1):
+        offset = tl.arange(0, B1) + i
+        x = tl.load(x_ptr + batch_offset[:, None] * T + offset, mask[:, None] & (offset < T))
+
+        # exp(x-new_max)=exp(x-old_max+old_max-new_max)=exp(x-old_max)*exp(old_max-new_max)
+        # This is called "online softmax"
+        new_x_max = tl.maximum(x_max, tl.max(x, axis=1))
+        new_exp_x = tl.exp2(log2_e * (x - new_x_max[:, None]))
+        factor = tl.exp2(log2_e * (x_max - new_x_max))
+        exp_sum = exp_sum * factor + tl.sum(new_exp_x, axis=1)
+        x_max = new_x_max
+
+    for i in range(0, T, B1):
+        offset = tl.arange(0, B1) + i
+        x = tl.load(x_ptr + batch_offset[:, None] * T + offset, mask[:, None] & (offset < T))
+        x = x - x_max
+        x_exp = tl.exp2(log2_e * x)
+        z = x_exp / exp_sum
+        tl.store(z_ptr + batch_offset[:, None] * T + offset, z, mask[:, None] & (offset < T))
     return
 
 
@@ -431,6 +511,29 @@ def softmax_kernel_brute_force(
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    batch_offset = block_id_i * B0 + tl.arange(0, B0)
+    mask = batch_offset < N0
+    x_max = tl.zeros((B0,), dtype=tl.float32)
+    exp_sum = tl.zeros((B0,), dtype=tl.float32)
+    for i in range(0, T, B1):
+        offset = tl.arange(0, B1) + i
+        x = tl.load(x_ptr + batch_offset[:, None] * T + offset, mask[:, None] & (offset < T))
+        x_max = tl.maximum(x_max, x.max(1))
+    
+    for i in range(0, T, B1):
+        offset = tl.arange(0, B1) + i
+        x = tl.load(x_ptr + batch_offset[:, None] * T + offset, mask[:, None] & (offset < T))
+        x = x - x_max
+        x_exp = tl.exp2(log2_e * x)
+        exp_sum += x_exp.sum(1)
+    
+    for i in range(0, T, B1):
+        offset = tl.arange(0, B1) + i
+        x = tl.load(x_ptr + batch_offset[:, None] * T + offset, mask[:, None] & (offset < T))
+        x = x - x_max
+        x_exp = tl.exp2(log2_e * x)
+        z = x_exp / exp_sum
+        tl.store(z_ptr + batch_offset[:, None] * T + offset, z, mask[:, None] & (offset < T))
     return
 
 
@@ -469,6 +572,9 @@ def flashatt_kernel(
     log2_e = 1.44269504
     myexp = lambda x: tl.exp2(log2_e * x)
     # Finish me!
+    batch_offset = block_id_i * B0 + tl.arange(0, B0)
+    mask = batch_offset < N0
+    
     return
 
 
